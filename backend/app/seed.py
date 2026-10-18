@@ -11,8 +11,35 @@ RES = [("res_water","p_food","water",300),("res_food","p_food","food",200),("res
        ("res_med","p_med","medical",40)]
 NEEDS = [("n1","velachery","water",350,3),("n2","adyar","food",120,2),("n3","adyar","medical",60,5),("n4","tambaram","food",90,1)]
 
+DEMO_INCIDENT = "chennai-flood"
+
+def _params():
+    return {"incident": DEMO_INCIDENT, "locations": [x[0] for x in LOCS], "roads": [x[0] for x in ROADS],
+            "providers": [x[0] for x in PROVIDERS], "resources": [x[0] for x in RES], "needs": [x[0] for x in NEEDS]}
+
+# Each step matches ONLY demo nodes: exact demo ids AND a synthetic marker or a link to the synthetic incident.
+_STEPS = [
+    ("needs",     "MATCH (x:Need) WHERE x.id IN $needs AND x.verification='synthetic'"),
+    ("resources", "MATCH (p:Provider)-[:OFFERS]->(x:Resource) WHERE p.id IN $providers AND p.verification='synthetic' AND x.id IN $resources"),
+    ("roads",     "MATCH (p:Provider)-[:DELIVERS_VIA]->(x:Road) WHERE p.id IN $providers AND p.verification='synthetic' AND x.id IN $roads"),
+    ("locations", "MATCH (i:Incident {id:$incident})-[:OCCURRED_AT]->(x:Location) WHERE i.data_origin='synthetic' AND x.id IN $locations"),
+    ("providers", "MATCH (x:Provider) WHERE x.id IN $providers AND x.verification='synthetic'"),
+    ("decisions", "MATCH (x:Decision) WHERE x.road IN $roads"),
+    ("incident",  "MATCH (x:Incident {id:$incident}) WHERE x.data_origin='synthetic'"),
+]
+
+def remove_demo(apply=False):
+    """Count (default) or delete the synthetic scenario. Live incidents, facilities, snapshots, sources and assessments are never matched."""
+    counts, p = {}, _params()
+    for name, match in _STEPS:
+        counts[name] = (q(match + " RETURN count(DISTINCT x)", p) or [[0]])[0][0]
+        if apply and counts[name]:
+            q(match + " DETACH DELETE x", p)
+    return counts
+
 def reset():
-    q("MATCH (n) WHERE NOT n:Snapshot AND NOT n:Source AND NOT n:Assessment AND NOT n:Lease AND NOT (n:Incident AND n.data_origin STARTS WITH 'live') DETACH DELETE n")  # keep history + live data
+    """Re-create ONLY the demo scenario. Never wipes live data (the old version deleted every unlisted node, including live facilities)."""
+    remove_demo(apply=True)
     seed()
 
 def seed():
@@ -35,3 +62,11 @@ def seed():
     for id_, loc, cat, qty, pri in NEEDS:
         q("MATCH (l:Location {id:$l}) MERGE (n:Need {id:$id}) SET n.category=$c, n.qty=$q, n.priority=$p, n.verification='synthetic' "
           "MERGE (l)-[:HAS_NEED]->(n)", {"id": id_, "l": loc, "c": cat, "q": qty, "p": pri})
+
+
+if __name__ == "__main__":
+    # Dry run:  python -m app.seed          Delete demo data:  python -m app.seed --apply
+    import sys
+    from dotenv import load_dotenv; load_dotenv()
+    apply = "--apply" in sys.argv
+    print(("DELETED" if apply else "DRY RUN (nothing deleted); would delete"), remove_demo(apply))

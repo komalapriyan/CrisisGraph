@@ -1,0 +1,19 @@
+# Vercel's free plan only allows one cron run per day, so GitHub triggers frequent ingestion instead.
+# Repo secrets needed: BACKEND_URL (e.g. https://crisisgraph-api.vercel.app, no trailing slash) and CRON_SECRET.
+name: ingest
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call backend cron endpoint
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail --silent --show-error --max-time 280 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$BACKEND_URL/api/cron/ingest"

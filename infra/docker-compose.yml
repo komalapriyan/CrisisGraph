@@ -1,7 +1,39 @@
+
 services:
   falkordb:
     image: falkordb/falkordb:latest
-    ports: ["6379:6379", "3000:3000"]
-    volumes: ["falkor_data:/data"]
+    ports:
+      - "6379:6379"
+      - "3000:3000"
+    volumes:
+      - falkor_data:/data
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: "6379"
+      FALKORDB_GRAPH: crisisgraph
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - falkordb
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
 volumes:
   falkor_data:

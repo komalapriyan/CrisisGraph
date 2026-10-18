@@ -1,70 +1,65 @@
-"""Universal incident graph builder. Deterministic and OFFLINE: every valid incident gets
-Incident -[:OCCURRED_AT]-> Area and Incident -[:REQUIRES]-> Requirement, whether or not AI or facility discovery worked.
-Requirements come from the stored Gemini assessment when it succeeded, else from the labelled rule fallback.
-Nothing here claims a road is blocked, a facility operates, or stock exists."""
-import re, logging
-from .db import q
-from .assess import assess
+"""Incident-scoped graph payload builder.
 
-log = logging.getLogger("graphbuild")
-NEED_TO_FACILITY = {"medical": ["hospital", "clinic", "pharmacy"], "search and rescue": ["fire_station"], "shelter": ["assembly_point"]}
-KW = [(("medical", "hospital", "injur", "trauma", "health", "clinic", "pharm", "ambulance"), ["hospital", "clinic", "pharmacy"]),
-      (("rescue", "fire", "search"), ["fire_station"]), (("shelter", "evacu", "housing", "assembly"), ["assembly_point"])]
-COLS = ["id", "name", "category", "severity", "alert_level", "magnitude", "data_origin", "lat", "lng", "precision"]
+Pure functions: no database, no network, no AI. The incident node is ALWAYS built from the
+incident record itself, so an incident with zero stored relationships still yields a valid graph
+(one node) instead of an empty one. Nothing is invented: every other node and edge comes from a row
+that the database actually returned.
+"""
 
-def valid(inc):
-    la, lo = inc.get("lat"), inc.get("lng")
-    return all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (la, lo)) and -90 <= la <= 90 and -180 <= lo <= 180
+NODE_PROPS = ("lat", "lng", "category", "verification", "source_url", "data_origin")
+EDGE_PROPS = ("distance_km", "retrieved_at")
+INCIDENT_PROPS = ("category", "severity", "source", "source_url", "data_origin", "lat", "lng",
+                  "event_time", "retrieved_at", "alert_level", "precision")
 
-def fac_types(text):
-    t = text.lower(); out = []
-    for words, cats in KW:
-        if any(w in t for w in words): out += [c for c in cats if c not in out]
-    return out
+N = 4 + len(NODE_PROPS)   # columns per node in a result row
+E = 1 + len(EDGE_PROPS)   # columns per edge in a result row
 
-def requirement_specs(inc):
-    try:
-        from . import agent
-        st = agent.get_stored(inc["id"])
-        needs = ((st.get("data") or {}).get("resource_needs") if st.get("status") == "ok" else None) or []
-        if needs: return [{"category": n["resource"][:80], "priority": n["priority"], "reason": n["reason"], "basis": "gemini", "fac": fac_types(n["resource"] + " " + n["reason"])} for n in needs]
-    except Exception as e:
-        log.debug("no AI needs for %s (%s); using rules", inc.get("id"), type(e).__name__)
-    return [{"category": n["category"], "priority": n["priority"], "reason": n["reason"], "basis": "rules_v1", "fac": NEED_TO_FACILITY.get(n["category"], [])} for n in assess(inc)["needs"]]
 
-def ensure_base_graph(inc):
-    """Idempotent. Returns the requirement specs, or None if coordinates are invalid (then nothing is written)."""
-    if not valid(inc): return None
-    iid = inc["id"]
-    q("MATCH (i:Incident {id:$i}) MERGE (a:Area {id:$a}) SET a.name=$n, a.lat=$la, a.lng=$lo, a.precision=$p, a.basis='event_coordinates' MERGE (i)-[:OCCURRED_AT]->(a)",
-      {"i": iid, "a": f"area-{iid}", "n": (inc.get("name") or iid)[:80], "la": inc["lat"], "lo": inc["lng"], "p": inc.get("precision") or "point"})
-    specs, ids = requirement_specs(inc), []
-    for sp in specs:
-        sp["id"] = rid = f"req-{iid}-{re.sub(r'[^a-z0-9]+', '_', sp['category'].lower()).strip('_')[:40]}"; ids.append(rid)
-        q("MATCH (i:Incident {id:$i}) MERGE (r:Requirement {id:$r}) SET r.category=$c, r.priority=$p, r.reason=$why, r.basis=$b, r.quantity='not_estimated' MERGE (i)-[:REQUIRES]->(r)",
-          {"i": iid, "r": rid, "c": sp["category"], "p": sp["priority"], "why": sp["reason"][:300], "b": sp["basis"]})
-    q("MATCH (r:Requirement) WHERE r.id STARTS WITH $pre AND NOT r.id IN $ids DETACH DELETE r", {"pre": f"req-{iid}-", "ids": ids})
-    return specs
+def node_cols(v):
+    return (f"{v}.id, labels({v})[0], coalesce({v}.name,{v}.category,{v}.id), coalesce({v}.status,''), "
+            + ", ".join(f"{v}.{p}" for p in NODE_PROPS))
 
-def link_facilities(inc, ents, specs, now):
-    iid = inc["id"]
-    for f in ents:
-        q("MERGE (f:Facility {id:$id}) SET f.name=$name, f.category=$category, f.lat=$lat, f.lng=$lng, f.source_url=$source_url, f.phone=$phone, f.website=$website, f.verification=$verification, f.status='unverified'", f)
-        q("MATCH (i:Incident {id:$i}),(f:Facility {id:$f}) MERGE (i)-[r:NEAR]->(f) SET r.distance_km=$d, r.source='osm_overpass', r.retrieved_at=$t", {"i": iid, "f": f["id"], "d": f["distance_km"], "t": now})
-    q("MATCH (i:Incident {id:$i})-[r:NEAR]->(f:Facility) WHERE NOT f.id IN $ids DELETE r", {"i": iid, "ids": [f["id"] for f in ents]})
-    for sp in specs or []:
-        for f in ents:
-            if f["category"] in sp["fac"]:
-                q("MATCH (f:Facility {id:$f}),(r:Requirement {id:$r}) MERGE (f)-[x:RELEVANT_TO]->(r) SET x.basis='osm_category_match', x.verified=false", {"f": f["id"], "r": sp["id"]})
 
-def ensure_all(limit=50):
-    """Cheap sweep: live incidents with no Area yet, or whose AI assessment succeeded after rule-based requirements were stored."""
-    cols = ",".join("i." + c for c in COLS)
-    rows = q("MATCH (i:Incident) WHERE i.source IS NOT NULL AND i.lat IS NOT NULL OPTIONAL MATCH (i)-[:OCCURRED_AT]->(a:Area) WITH i, a WHERE a IS NULL RETURN " + cols + " LIMIT $n", {"n": limit}) \
-         + q("MATCH (i:Incident)-[:HAS_ASSESSMENT]->(s:Assessment {status:'ok'}) WHERE i.lat IS NOT NULL OPTIONAL MATCH (i)-[:REQUIRES]->(r:Requirement {basis:'gemini'}) WITH i, count(r) AS c WHERE c=0 RETURN " + cols + " LIMIT $n", {"n": limit})
-    seen = {}
-    for r in rows: seen[r[0]] = dict(zip(COLS, r))
-    for inc in seen.values():
-        try: ensure_base_graph(inc)
-        except Exception: log.exception("base graph failed for %s", inc["id"])
-    return len(seen)
+def edge_cols(e):
+    return f"type({e}), " + ", ".join(f"{e}.{p}" for p in EDGE_PROPS)
+
+
+ROW_COLS = node_cols("a") + ", " + edge_cols("e") + ", " + node_cols("b")
+
+
+def _node(c):
+    nid, ntype, label, status, *vals = c
+    return {"id": nid, "type": ntype or "Unknown", "label": str(label if label is not None else nid),
+            "status": status or "",
+            "properties": {k: v for k, v in zip(NODE_PROPS, vals) if v is not None}}
+
+
+def _incident_node(inc):
+    return {"id": inc["id"], "type": "Incident", "label": str(inc.get("name") or inc["id"]),
+            "status": inc.get("status") or "",
+            "properties": {k: inc[k] for k in INCIDENT_PROPS if inc.get(k) is not None}}
+
+
+def build_incident_graph(incident, rows):
+    """rows: tuples laid out as ROW_COLS (node a, edge e, node b)."""
+    nodes = {incident["id"]: _incident_node(incident)}
+    edges = {}
+    for r in rows:
+        if len(r) < 2 * N + E:
+            continue
+        a, e, b = r[:N], r[N:N + E], r[N + E:2 * N + E]
+        if a[0] is None or b[0] is None or e[0] is None:
+            continue                      # malformed row: skip rather than crash or guess
+        nodes.setdefault(a[0], _node(a))
+        nodes.setdefault(b[0], _node(b))
+        edges.setdefault((a[0], e[0], b[0]),
+                         {"from": a[0], "to": b[0], "type": e[0],
+                          "properties": {k: v for k, v in zip(EDGE_PROPS, e[1:]) if v is not None}})
+    ordered = [edges[k] for k in sorted(edges)]
+    warnings = []
+    if not ordered:
+        warnings.append("No relationships are stored for this incident yet. Nothing has been invented to fill the graph.")
+    if incident.get("discovery_status") == "failed":
+        warnings.append("Facility discovery failed, so nearby facilities are missing from this graph.")
+    return {"incident_id": incident["id"], "nodes": list(nodes.values()), "edges": ordered,
+            "metadata": {"data_status": "partial" if ordered else "incident_only", "warnings": warnings}}

@@ -1,13 +1,13 @@
-from .ai_status import router as ai_router
 try:
     from dotenv import load_dotenv; load_dotenv()   # reads backend/.env if python-dotenv is installed
 except ImportError:
     pass
-import os, json, time, logging, asyncio
-from fastapi import FastAPI, HTTPException
+import os, json, time, logging, asyncio, hmac
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from .db import q
 from .seed import reset
+from .graphbuild import ROW_COLS, build_incident_graph
 from .allocator import allocate
 from . import ingest, agent, discover
 from .assess import assess
@@ -16,6 +16,12 @@ from .ai_status import router as ai_router
 
 app = FastAPI(title="CrisisGraph")
 
+def ingest_enabled():
+    """The in-process ingest loop cannot run on serverless (Vercel sets VERCEL=1); use /api/cron/ingest there."""
+    return os.getenv("INGEST_ENABLED", "false" if os.getenv("VERCEL") else "true").lower() == "true"
+
+_EXTRA_ORIGINS = [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -23,7 +29,7 @@ app.add_middleware(
         "http://localhost:5500",
         "http://127.0.0.1:8080",
         "http://localhost:8080",
-    ],
+    ] + _EXTRA_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,6 +48,9 @@ def health():
 
 @app.post("/api/seed")
 def do_seed():
+    """Demo only. Disabled unless DEMO_MODE=true; reset() only touches the synthetic scenario."""
+    if os.getenv("DEMO_MODE", "false").lower() != "true":
+        raise HTTPException(403, "Demo data is disabled. Set DEMO_MODE=true in backend/.env to enable the simulated scenario.")
     guard(reset); return {"status": "seeded (synthetic)"}
 
 INC_FIELDS = ["id","name","category","status","severity","lat","lng","summary","data_origin","source","source_url","alert_level","event_time","updated_at","retrieved_at","precision","also_reported_by", "discovery_status", "discovery_at", "discovery_error"]
@@ -192,7 +201,7 @@ def history(range: str = "hourly", metric: str = "unmet"):
 # ---- live ingestion --------------------------------------------------------
 @app.on_event("startup")
 async def _start_ingest():
-    if os.getenv("INGEST_ENABLED", "true").lower() == "true":
+    if ingest_enabled():
         asyncio.create_task(ingest.scheduler())
 
 @app.get("/api/sources")
@@ -207,9 +216,26 @@ async def ingest_run(source: str):
     ingest.last_run[source] = time.time()
     return await ingest.run_source(source)
 
+@app.get("/api/cron/ingest")
+async def cron_ingest(authorization: str = Header(default="")):
+    """Called by Vercel Cron / GitHub Actions. Disabled unless CRON_SECRET is set; needs 'Authorization: Bearer <CRON_SECRET>'."""
+    secret = os.getenv("CRON_SECRET", "")
+    if not secret:
+        raise HTTPException(503, "CRON_SECRET is not set on the backend, so the cron endpoint is disabled")
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {secret}".encode()):
+        raise HTTPException(401, "Unauthorized")
+    out = {}
+    for src in list(ingest.FETCH):
+        try:
+            out[src] = await ingest.run_source(src)
+        except Exception as e:                       # one failing source must not stop the others
+            logging.exception("cron ingest failed for %s", src)
+            out[src] = {"error": type(e).__name__}
+    return out
+
 @app.get("/api/workflow/status")
 def workflow_status():
-    return {**guard(agent.workflow_status), "scheduler_enabled": os.getenv("INGEST_ENABLED", "true").lower() == "true",
+    return {**guard(agent.workflow_status), "scheduler_enabled": ingest_enabled(),
             "sources": sources()}
 
 @app.post("/api/incidents/{iid}/analyze")
@@ -219,20 +245,14 @@ async def analyze(iid: str):
     if not agent.configured(): raise HTTPException(503, "GEMINI_API_KEY is not set on the backend")
     return {"result": await agent.analyze_incident(inc), "assessment": agent.get_stored(iid)}
 
-GN = "{0}.id, labels({0})[0], coalesce({0}.name,{0}.category,{0}.id), coalesce({0}.status,'')"
-
 @app.get("/api/incidents/{iid}/graph")
 def incident_graph(iid: str):
-    """Incident-scoped subgraph (outgoing, 2 hops), straight from FalkorDB."""
-    incident(iid)
-    cols = GN.format("a") + ", type(e), " + GN.format("b")
-    rows = guard(lambda: q("MATCH (i:Incident {id:$i})-[e]->(b) WHERE NOT b:Assessment WITH i AS a, e, b RETURN " + cols, {"i": iid})
-                 + q("MATCH (i:Incident {id:$i})-[]->(a)-[e]->(b) RETURN " + cols, {"i": iid}))
-    nodes, edges = {}, set()
-    for r in rows:
-        nodes[r[0]] = {"id": r[0], "type": r[1], "label": r[2], "status": r[3]}; nodes[r[5]] = {"id": r[5], "type": r[6], "label": r[7], "status": r[8]}
-        edges.add((r[0], r[4], r[5]))
-    return {"nodes": list(nodes.values()), "edges": [{"from": a, "type": t, "to": b} for a, t, b in sorted(edges)]}
+    """Incident-scoped subgraph (outgoing, 2 hops) from FalkorDB. The incident node always comes from the record."""
+    inc = incident(iid)
+    first = "MATCH (i:Incident {id:$i})-[e]->(b) WHERE NOT b:Assessment WITH i AS a, e, b RETURN " + ROW_COLS
+    second = "MATCH (i:Incident {id:$i})-[]->(a)-[e]->(b) WHERE NOT a:Assessment AND NOT b:Assessment RETURN " + ROW_COLS
+    rows = guard(lambda: q(first, {"i": iid}) + q(second, {"i": iid}))
+    return build_incident_graph(inc, rows)
 
 @app.get("/api/incidents/{iid}/facilities")
 def facilities(iid: str):
