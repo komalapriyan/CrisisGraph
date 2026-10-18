@@ -1,0 +1,89 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CrisisGraph — Incident</title><link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@600;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"><script src="theme.js"></script><link rel="stylesheet" href="app.css"></head><body>
+<nav class="pill"><a class="logo" href="index.html">CrisisGraph</a><button class="btn ghost" id="theme">Theme</button><details class="menu"><summary class="btn ghost">Menu</summary><div class="drop"><a href="index.html">← Dashboard</a><a href="index.html#globe-sec">← Globe</a></div></details></nav>
+<main><div class="mute">Dashboard / Incidents / <span id="crumb">…</span></div>
+<div class="top"><h1 id="name">Loading…</h1><span class="pill" id="sev"></span><span class="pill" id="stat"></span><span class="pill sim" id="orig"></span><button class="btn ghost" id="rf">Refresh</button></div>
+<div id="err" class="card bad" hidden></div>
+<div id="body" hidden>
+<div class="grid two"><div class="card"><h2>Overview</h2><p id="sum"></p><p class="mute" id="meta"></p></div>
+<div class="card"><h2 id="depT">Resource reachability</h2><div class="wrap"><table id="deps"></table></div></div></div>
+<div class="grid two"><div class="card"><h2>Dependency graph <span class="mute">click a node</span></h2><div class="wrap"><svg id="g" width="900" height="360" viewBox="0 0 900 360" role="img" aria-label="Dependency graph"></svg></div><p class="mute" id="gnote"></p></div>
+<div class="card"><h2>Node details</h2><div id="nd" class="mute">Select a node.</div></div></div>
+<div class="card"><h2>Resource assessment</h2><div class="wrap"><div id="plan"></div></div></div></div></main>
+<script src="api.js"></script>
+<script>
+const id=new URLSearchParams(location.search).get("id");
+const COL=["Incident","Area","Location","Road","Provider","Resource","Need","Requirement","Facility"],CC={Area:"#3b82f6",Requirement:"#f97316",Facility:"#22d3ee",Incident:"#ef4444",Location:"#3b82f6",Road:"#a78bfa",Provider:"#22d3ee",Resource:"#22c55e",Need:"#f97316"};
+function renderDeps(d,fac){
+ if(!fac){$("depT").textContent="Resource reachability";$("deps").innerHTML="<tr><th>Location</th><th>Road</th><th>Provider</th><th>Resource</th><th>Stock</th></tr>"+(d.length?d.map(r=>`<tr><td>${esc(r.location)}</td><td class="${r.road_status==="open"?"ok":"bad"}">${esc(r.road)} (${esc(r.road_status)})</td><td>${esc(r.provider)}</td><td>${esc(r.resource)}</td><td>${r.stock}</td></tr>`).join(""):'<tr><td colspan=5 class="mute">No dependencies stored.</td></tr>');return}
+ $("depT").textContent="Nearby mapped facilities";const x=fac.discovery;
+ if(x.status!=="ok"){$("deps").innerHTML=`<tr><td class="mute">${x.status==="failed"?"Facility lookup failed: "+esc(x.error||"unknown")+". The incident graph is still built; the lookup retries every 10 minutes. ":"Facility lookup has not run yet. The backend runs it in the background for live incidents."} <button class="btn" onclick="runDisc()">Find facilities now</button> <span id="dsMsg" class="mute"></span></td></tr>`;return}
+ $("deps").innerHTML="<tr><th>Facility</th><th>Type</th><th>km</th><th>Source</th></tr>"+(fac.facilities.length?fac.facilities.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(String(f.category||"facility").replace("_"," "))}</td><td>${f.distance_km??"unknown"}</td><td><a href="${esc(f.source_url)}" target="_blank" rel="noopener">OSM</a></td></tr>`).join(""):`<tr><td colspan=4 class="mute">No mapped facilities within ${x.radius_km} km.</td></tr>`)
+  +`<tr><td colspan=4 class="mute">${esc(x.source)}, retrieved ${x.at?new Date(x.at*1000).toLocaleString():""}. Mapped only: not verified as operating, staffed or stocked.</td></tr>`}
+async function renderAssess(a){
+ const ai=a.ai||{status:"disabled"},ok=ai.status==="ok"&&ai.data;let h="";
+ h+=`<h2>AI assessment <span class="pill ${ok?"ok":ai.status==="unavailable"?"bad":""}">${esc(ok?"Gemini"+(ai.model?" · "+ai.model:""):ai.status)}</span></h2>`;
+ if(ai.data){const d=ai.data;h+=`<p class="mute">${esc(ai.label||"AI-generated; not verified")} · ${ai.created_at?new Date(ai.created_at*1000).toLocaleString():""}${ai.stale?" · <span class=bad>latest refresh failed: "+esc(ai.error||"")+"</span>":""}</p><p>${esc(d.summary)}</p>`
+  +[["Stated by the record",d.confirmed],["Unverified",d.unverified],["AI inferences",d.inferences],["Unknown",d.unknowns]].map(([t,l])=>l&&l.length?`<p class="mute">${t}</p><ul>${l.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`:"").join("")
+  +"<table><tr><th>Resource</th><th>Priority</th><th>Reason</th></tr>"+d.resource_needs.map(n=>`<tr><td>${esc(n.resource)}</td><td>${esc(n.priority)}</td><td>${esc(n.reason)}</td></tr>`).join("")+`</table><p class="mute">Confidence: ${esc(d.confidence)}. No quantities are given because none are verified.</p>`}
+ else h+=`<p class="mute">${esc(ai.status==="disabled"?(ai.reason||"AI is not configured: set GEMINI_API_KEY in backend/.env and restart."):ai.status==="unavailable"?"AI assessment failed: "+(ai.error||"unknown error"):"Analysis pending. It runs in the background for live incidents (a few per cycle), or run it now.")}</p>`;
+ h+=`<button class="btn" onclick="runAi()">${ai.data?"Re-run":"Run"} AI analysis</button> <span id="aiMsg" class="mute"></span>`;
+ let fb=`<p class="mute">${esc(a.basis)}</p>`;
+ if(a.needs.length)fb+="<table><tr><th>Likely need</th><th>Priority</th><th>Why</th></tr>"+a.needs.map(n=>`<tr><td>${esc(n.category)}</td><td>${esc(n.priority)}</td><td>${esc(n.reason)}</td></tr>`).join("")+"</table>";
+ fb+=`<p class="mute">Not known, so no quantities are estimated: ${a.data_gaps.map(esc).join(", ")}. Verify with authorised responders.</p>`;
+ h+=ok?`<details style="margin-top:18px"><summary class="mute">Rule-based fallback (not AI; not used because Gemini succeeded)</summary>${fb}</details>`:`<h2 style="margin-top:18px">Rule-based fallback <span class="pill">not AI</span></h2>${fb}`;
+ if(a.planner==="simulation"){try{const p=await j("/plan");h+="<h2>Simulated allocation plan</h2><table><tr><th>Need</th><th>Qty</th><th>Provider</th><th>Via</th></tr>"+p.allocations.map(x=>`<tr><td>${esc(x.location)} · ${esc(x.category)}</td><td>${x.qty}</td><td>${esc(x.provider)}</td><td>${esc(x.road)}</td></tr>`).join("")+p.unmet.map(u=>`<tr class="bad"><td>${esc(u.location)} · ${esc(u.category)}</td><td>${u.qty} unmet</td><td colspan=2>no feasible supply</td></tr>`).join("")+"</table>"}catch(e){h+=`<p class="bad">${esc(e.message)}</p>`}}
+ $("plan").innerHTML=h;
+}
+async function act(path,msgId){const m=$(msgId);m.textContent="Running…";try{const r=await j("/incidents/"+encodeURIComponent(id)+path,{method:"POST"});m.textContent="Result: "+r.result;await load()}catch(e){m.textContent="Failed: "+e.message}}
+const runAi=()=>act("/analyze","aiMsg"),runDisc=()=>act("/discover","dsMsg");
+function fail(m){$("err").hidden=false;$("err").innerHTML=m+' <a href="index.html">Back to Dashboard</a>';$("body").hidden=true;$("name").textContent="Incident unavailable"}
+let loadSeq=0;
+async function load(){
+ if(!id)return fail("No incident id in the URL.");
+ const seq=++loadSeq;
+ try{
+  const en=encodeURIComponent(id),i=await j("/incidents/"+en),live=!!i.source;
+  const S=p=>Promise.resolve(p).then(v=>({v}),e=>({e}));   // one failing section must not hide the others
+  const [d,g,as,fac]=await Promise.all([
+   S(live?[]:j("/incidents/"+en+"/dependencies").catch(x=>x.status===404?[]:Promise.reject(x))),
+   S(live?j("/incidents/"+en+"/graph"):j("/graph")),
+   S(j("/incidents/"+en+"/assessment")),
+   S(live?j("/incidents/"+en+"/facilities"):null)]);
+  if(seq!==loadSeq)return;   // a newer load started; drop this stale result
+  $("err").hidden=true;$("body").hidden=false;document.title="CrisisGraph — "+i.name;
+  $("crumb").textContent=$("name").textContent=i.name;$("sev").textContent=i.severity||"unrated";$("sev").style.color=SEV[i.severity||"unrated"];
+  $("stat").textContent=i.status;$("orig").textContent=i.data_origin==="synthetic"?"SIMULATED":i.data_origin;$("sum").innerHTML=esc(i.summary)+(i.source_url?` <a href="${esc(i.source_url)}" target="_blank" rel="noopener">Source: ${esc(i.source)}</a>`:"");
+  $("meta").textContent=`ID ${i.id} · ${i.category} · ${i.source?"source "+i.source:"simulated"} · event ${i.event_time?new Date(i.event_time*1000).toLocaleString():"time unknown"} · retrieved ${i.retrieved_at?new Date(i.retrieved_at*1000).toLocaleString():"n/a"} · ${Number.isFinite(i.lat)?i.lat+", "+i.lng:"no coordinates"} · loaded ${new Date().toLocaleTimeString()}`;
+  const dep=live?fac:d;
+  if(dep.e)$("deps").innerHTML=`<tr><td class="bad">This section could not be loaded: ${esc(dep.e.message)} <button class="btn" onclick="load()">Retry</button></td></tr>`;else renderDeps(d.v,fac.v);
+  if(as.e)$("plan").innerHTML=`<p class="bad">Assessment could not be loaded: ${esc(as.e.message)}</p>`;
+  else renderAssess(as.v).catch(x=>{$("plan").innerHTML=`<p class="bad">Assessment could not be displayed: ${esc(x.message)}</p>`});
+  const gn=$("gnote");gn.textContent="";
+  if(g.e){$("g").style.display="none";$("g").innerHTML="";$("nd").innerHTML=`<span class="bad">The graph could not be loaded: ${esc(g.e.message)}</span>`}
+  else if(g.v.nodes.some(n=>n.id===i.id)){drawGraph(g.v,i.id);const m=g.v.metadata||{};gn.textContent=(m.warnings||[]).join(" ")}
+  else{$("g").style.display="none";$("g").innerHTML="";$("nd").textContent="The server returned no graph data for this incident."}
+ }catch(e){fail(e.status===404?"Incident “"+esc(id)+"” was not found.":esc(e.message))}
+}
+function drawGraph(g,focus){
+ const svg=$("g"),pos={},tot={},cnt={};let h="";
+ g.nodes.forEach(n=>{tot[n.type]=(tot[n.type]||0)+1});
+ const types=COL.filter(t=>tot[t]),mx=Math.max(...Object.values(tot)),gap=mx>8?32:62,H=Math.max(360,40+mx*gap),Wd=Math.max(900,types.length*150+60);
+ g.nodes.forEach(n=>{cnt[n.type]=cnt[n.type]||0;pos[n.id]={x:60+Math.max(0,types.indexOf(n.type))*150,y:30+cnt[n.type]++*gap}});
+ svg.setAttribute("viewBox",`0 0 ${Wd} ${H}`);svg.setAttribute("width","100%");svg.removeAttribute("height");svg.style.maxHeight="560px";svg.style.display="";
+ g.edges.forEach((e,k)=>{const a=pos[e.from],b=pos[e.to];h+=`<line data-e="${k}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="#3b4a6b" stroke-width="1.2"><title>${esc(e.type)}</title></line>`});
+ g.nodes.forEach(n=>{const p=pos[n.id],bad=n.status==="closed"||n.status==="inactive";
+  h+=`<g class="n" data-id="${esc(n.id)}" tabindex="0" style="cursor:pointer"><circle cx="${p.x}" cy="${p.y}" r="13" fill="${CC[n.type]||"#888"}" stroke="${bad?"#ef4444":"#0b1220"}" stroke-width="${bad?4:2}"/><text x="${p.x}" y="${p.y+27}" text-anchor="middle">${esc(String(n.label).slice(0,16))}</text></g>`});
+ svg.innerHTML=h;
+ const fmt=(k,v)=>/(_time|_at)$/.test(k)&&Number.isFinite(v)?new Date(v*1000).toLocaleString():/^https?:\/\//.test(String(v))?`<a href="${esc(String(v))}" target="_blank" rel="noopener">${esc(String(v))}</a>`:esc(String(v));
+ const show=nid=>{const n=g.nodes.find(x=>x.id===nid);if(!n)return;const rel=g.edges.filter(e=>e.from===nid||e.to===nid);
+  svg.querySelectorAll("line").forEach((l,k)=>{const on=rel.includes(g.edges[k]);l.setAttribute("stroke",on?"#22d3ee":"#3b4a6b");l.setAttribute("stroke-width",on?2.5:1.2)});
+  const pr=Object.entries(n.properties||{}).map(([k,v])=>`<tr><td class="mute">${esc(k)}</td><td>${fmt(k,v)}</td></tr>`).join("");
+  $("nd").innerHTML=`<b>${esc(n.label)}</b> <span class="pill">${esc(n.type)}</span> <span class="pill ${n.status==="closed"?"bad":""}">${esc(n.status||"no status")}</span><p class="mute">ID ${esc(n.id)}</p>`
+   +(pr?`<table>${pr}</table>`:'<p class="mute">No further attributes are stored for this node.</p>')
+   +(rel.length?"<ul>"+rel.map(e=>{const o=g.nodes.find(x=>x.id===(e.from===nid?e.to:e.from)),ep=e.properties||{};return `<li>${e.from===nid?"":"← "}${esc(e.type)}${e.from===nid?" →":""} ${esc(o?o.label:"?")}${ep.distance_km!=null?" ("+esc(String(ep.distance_km))+" km)":""}</li>`}).join("")+"</ul>":'<p class="mute">No relationships are stored for this node yet.</p>')};
+ svg.querySelectorAll(".n").forEach(el=>{el.onclick=()=>show(el.dataset.id);el.onkeydown=e=>{if(e.key==="Enter")show(el.dataset.id)}});
+ if(pos[focus])show(focus);
+}
+$("rf").onclick=load;load();
+</script></body></html>

@@ -1,0 +1,100 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CrisisGraph — Dashboard</title><link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@600;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"><script src="theme.js"></script><link rel="stylesheet" href="app.css">
+<script src="https://cdn.jsdelivr.net/npm/globe.gl@2.33.1/dist/globe.gl.min.js"></script>
+</head><body>
+<nav class="pill"><a class="logo" href="index.html">CrisisGraph</a><button class="btn ghost" id="theme">Theme</button><details class="menu"><summary class="btn ghost">Menu</summary><div class="drop"><a href="#dash">Dashboard</a><a href="#globe-sec">Crisis globe</a><a href="#inc">Incidents</a><a href="#res">Resource inventory</a><a href="#plan-sec">Response plan</a><a href="#sim">Simulation</a></div></details><button class="btn" id="refresh">Refresh</button></nav>
+<main id="dash"><section class="hero" id="globe-sec"><h1 class="mark">CRISISGRAPH</h1>
+<p class="lede mono">Crisis signals, roads, providers and stock, connected in one graph, so you can see what response is feasible. Simulated demo data.</p>
+<div class="stage"><div class="ring"></div><div class="callout l" id="c1"><span class="tag">01</span><p>Loading from the graph…</p></div>
+<div id="globe" role="application" aria-label="Interactive globe of incidents. Use the incident table for keyboard access."></div>
+<div class="callout r" id="c2"><span class="tag">02</span><p>Loading from the graph…</p></div></div>
+<p class="legend">Marker colour = severity: critical red · high orange · medium yellow · low cyan · grey unrated · slate = resolved. Live markers come from USGS/GDACS; Chennai is a labelled simulation. Click a marker to open its page.</p></section>
+<p class="mute mono" id="srcs" style="margin:0 0 8px"></p><div class="top"><input id="q" placeholder="Search incidents" aria-label="Search incidents"><select id="fSrc" aria-label="Source"></select><select id="fCat" aria-label="Category"></select><select id="fSt" aria-label="Status"></select><span class="pill" id="cnt"></span><label class="mute">Auto <select id="every"><option value="0">off</option><option value="15000">15s</option><option value="30000" selected>30s</option><option value="60000">60s</option></select></label>
+<span class="pill" id="conn">connecting…</span><span class="pill" id="upd">not updated</span><span class="pill sim">SIMULATED DATA</span></div>
+<div id="err" class="card bad" hidden></div>
+<div class="grid k" id="kpis"></div>
+<div class="dotcard" id="trend"><div class="panel"><div class="dc-head"><h2>Crisis Analytics</h2><span class="pill bad" id="dcStale" hidden>stale</span><span class="sp"></span>
+<select id="dcMetric" aria-label="Metric"><option value="unmet">Unmet demand</option><option value="allocated">Allocated</option><option value="closed_roads">Closed roads</option></select>
+<select id="dcRange" aria-label="Time range"><option value="hourly">Hourly</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></div>
+<div id="dc"></div><p class="mute mono dc-note">Source: snapshots of the simulated scenario, stored by the backend when its state changes. Empty periods have no snapshot; they are not zero. No yearly view yet: not enough history exists.</p></div></div>
+<div class="grid two"><div class="card"><h2>Incidents by severity</h2><div id="cSev"></div></div>
+<div class="card" id="res"><h2>Resources by category</h2><div id="cRes"></div></div></div>
+<div class="grid two"><div class="card" id="inc"><h2>Incidents</h2><div class="wrap"><table id="tbl"></table></div>
+</div></div>
+<div class="grid two"><div class="card" id="plan-sec"><h2>Current response plan</h2><div class="wrap"><table id="plan"></table></div></div>
+<div class="card" id="sim"><h2>Simulation <span class="pill sim">SIMULATED</span></h2>
+<button class="btn" id="close">Close Adyar Bridge</button> <button class="btn ghost" id="reset">Reset baseline</button>
+<p id="delta" class="mute">Closing a road re-runs the graph query and allocator on the backend.</p><div class="wrap"><table id="cmp"></table></div></div></div>
+</main>
+<script src="api.js"></script><script src="dotchart.js"></script><script src="dotviz.js"></script>
+<script>
+const cv=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let incidents=[], busy=false, timer=null, sevChart, resChart, globe, lastPlan=null;
+function mkGlobe(){
+ const el=$("globe");
+ globe=Globe()(el).width(el.clientWidth).height(el.clientHeight).globeImageUrl("https://unpkg.com/three-globe/example/img/earth-night.jpg")
+  .backgroundColor("rgba(0,0,0,0)").pointLat("lat").pointLng("lng").pointRadius(.7).pointAltitude(.03)
+  .pointColor(d=>d.status==="resolved"?"#64748b":(SEV[d.severity||"unrated"]||SEV.unrated))
+  .pointLabel(d=>`<div style="background:${cv("--card")};color:${cv("--ink")};padding:7px 10px;border:1px solid ${cv("--red")};font:12px IBM Plex Mono,monospace"><b>${esc(d.name)}</b><br>severity: ${esc(d.severity||"unrated")}<br>status: ${esc(d.status)}<br>${esc(d.category)} · ${d.source?esc(d.source.toUpperCase()):"SIMULATED"}<br>${d.event_time?new Date(d.event_time*1000).toLocaleString():""}<br>Open incident page →</div>`).ringLat("lat").ringLng("lng").ringColor(()=>t=>`rgba(229,55,45,${1-t})`).ringMaxRadius(3).ringPropagationSpeed(1.4).ringRepeatPeriod(1800)
+  .onPointClick(d=>{location.href="incident.html?id="+encodeURIComponent(d.id)});
+ addEventListener("resize",()=>globe.width(el.clientWidth).height(el.clientHeight));
+}
+const kpi=(l,v,h,s)=>`<a class="card kpi" href="${h}"><small>${l}</small><div class="${s||""}">${v}</div></a>`;
+function render(a,p){
+ $("kpis").innerHTML=kpi("Incidents",a.incidents_total,"#inc")+kpi("Roads closed",`${a.roads.closed}/${a.roads.open+a.roads.closed}`,"#sim",a.roads.closed?"bad":"ok")
+  +kpi("Unreachable locations",a.unreachable_locations.length,"#plan-sec",a.unreachable_locations.length?"bad":"ok")
+  +kpi("Units in stock",a.resources.reduce((s,r)=>s+r.stock,0),"#res")+kpi("Unmet demand",a.plan.unmet,"#plan-sec",a.plan.unmet?"bad":"ok")
+  +kpi("Plan coverage",a.plan.demand?Math.round(100*a.plan.allocated/a.plan.demand)+"%":"n/a","#plan-sec");
+ ring.set(a.severity);grp.set(a.resources);
+ renderPlan(p);lastPlan=p;callouts(a);
+}
+function callouts(a){
+ const n=a.incidents_total,c=a.roads.closed,u=a.unreachable_locations;
+ $("c1").lastElementChild.textContent=`/${n} incident${n===1?"":"s"} on the graph. ${c?c+" of "+(c+a.roads.open)+" roads closed.":"All "+a.roads.open+" roads open."} (simulated)`;
+ $("c2").lastElementChild.textContent=`/${u.length?u.join(", ")+" cannot be reached by any active provider.":"Every location has a reachable provider."} Unmet demand: ${a.plan.unmet} units.`;
+}
+addEventListener("themechange",()=>{globe.pointsData(globe.pointsData())});
+function renderPlan(p){
+ $("plan").innerHTML="<tr><th>Need</th><th>Qty</th><th>Provider</th><th>Via</th></tr>"+p.allocations.map(a=>`<tr title="${esc(a.why)}"><td>${esc(a.location)} · ${esc(a.category)}</td><td>${a.qty}</td><td>${esc(a.provider)}</td><td>${esc(a.road)}</td></tr>`).join("")
+  +p.unmet.map(u=>`<tr class="bad"><td>${esc(u.location)} · ${esc(u.category)}</td><td>${u.qty} unmet</td><td colspan=2>no feasible supply</td></tr>`).join("");
+}
+const srcOf=i=>i.source||"synthetic";
+function fillFilters(){
+ const set=(id,label,vals)=>{const el=$(id),cur=el.value;el.innerHTML=`<option value="">${label}</option>`+[...new Set(vals)].sort().map(v=>`<option>${esc(v)}</option>`).join("");el.value=cur};
+ set("fSrc","All sources",incidents.map(srcOf));set("fCat","All categories",incidents.map(i=>i.category));set("fSt","All statuses",incidents.map(i=>i.status));
+}
+function renderTable(){
+ const t=$("q").value.toLowerCase(),fs=$("fSrc").value,fc=$("fCat").value,fst=$("fSt").value;
+ const rows=incidents.filter(i=>(!fs||srcOf(i)===fs)&&(!fc||i.category===fc)&&(!fst||i.status===fst)&&(i.name+i.category+(i.summary||"")).toLowerCase().includes(t));
+ $("cnt").textContent=`${rows.length} of ${incidents.length} incidents`;
+ $("tbl").innerHTML="<tr><th>Name</th><th>Severity</th><th>Alert</th><th>Source</th><th>Status</th><th>Event time</th></tr>"+(rows.length?rows.slice(0,200).map(i=>`<tr><td><a href="incident.html?id=${encodeURIComponent(i.id)}">${esc(i.name)}</a></td><td style="color:${SEV[i.severity||"unrated"]}">${esc(i.severity||"unrated")}</td><td>${esc(i.alert_level||"-")}</td><td>${esc(srcOf(i))}</td><td>${esc(i.status)}</td><td>${i.event_time?new Date(i.event_time*1000).toLocaleString():"-"}</td></tr>`).join("")+(rows.length>200?`<tr><td colspan=6 class="mute">Showing 200 of ${rows.length}; use filters.</td></tr>`:""):'<tr><td colspan=6 class="mute">No incidents match.</td></tr>');
+ const ok=rows.filter(i=>Number.isFinite(i.lat)&&Number.isFinite(i.lng));globe.pointsData(ok);
+ globe.ringsData(matchMedia("(prefers-reduced-motion: reduce)").matches?[]:ok.filter(i=>i.severity==="critical"&&i.status!=="resolved"));
+}
+async function refresh(){
+ if(busy)return;busy=true;$("refresh").disabled=true;
+ try{
+  const [inc,a,p,src]=await Promise.all([j("/incidents"),j("/analytics"),j("/plan"),j("/sources").catch(()=>[])]);
+  incidents=inc;$("err").hidden=true;$("conn").textContent="backend connected";$("conn").className="pill ok";
+  $("upd").textContent="updated "+new Date().toLocaleTimeString();
+  if(!inc.length){$("err").hidden=false;$("err").innerHTML='No incidents in FalkorDB. <button class="btn" onclick="seed()">Seed synthetic demo data</button>'}
+  $("srcs").textContent=src.length?src.map(x=>`${x.id}: ${x.last_success?"ok "+new Date(x.last_success*1000).toLocaleTimeString():"never succeeded"}${x.last_error?" (last error: "+x.last_error+")":""}`).join(" · "):"No live feed has reported yet (backend ingestion may be off or still starting).";
+  fillFilters();render(a,p);renderTable();await loadHistory();
+ }catch(e){$("err").hidden=false;$("err").textContent=e.message+" (showing last successful data, may be stale)";$("conn").textContent="offline";$("conn").className="pill bad"}
+ finally{busy=false;$("refresh").disabled=false}
+}
+async function loadHistory(){
+ try{dot.set(await j(`/history?range=${$("dcRange").value}&metric=${$("dcMetric").value}`));$("dcStale").hidden=true}
+ catch(e){$("dcStale").hidden=false;dot.setMsg("History unavailable: "+e.message+(dot.hasData()?" (showing last data)":""))}}
+async function seed(){try{await j("/seed",{method:"POST"});refresh()}catch(e){$("err").textContent=e.message}}
+function schedule(){clearInterval(timer);const ms=+$("every").value;if(ms)timer=setInterval(refresh,ms)}
+$("refresh").onclick=refresh;$("every").onchange=schedule;$("q").oninput=$("fSrc").onchange=$("fCat").onchange=$("fSt").onchange=renderTable;
+$("close").onclick=async()=>{try{const r=await j("/simulate/close-road/r_adyar_bridge",{method:"POST"});
+ $("delta").textContent=`${r.affected_allocations.length} allocations used the bridge. Allocated ${r.before.total_allocated} → ${r.after.total_allocated} of ${r.after.total_demand} units (simulated).`;
+ const key=a=>a.need_id+"|"+a.provider;const b=new Set(r.before.allocations.map(key)),f=new Set(r.after.allocations.map(key));
+ $("cmp").innerHTML="<tr><th>Change</th><th>Allocation</th></tr>"+r.before.allocations.filter(a=>!f.has(key(a))).map(a=>`<tr class="bad"><td>lost</td><td>${esc(a.location)} ${esc(a.category)} ×${a.qty} from ${esc(a.provider)}</td></tr>`).join("")
+  +r.after.allocations.filter(a=>!b.has(key(a))).map(a=>`<tr class="ok"><td>new</td><td>${esc(a.location)} ${esc(a.category)} ×${a.qty} from ${esc(a.provider)}</td></tr>`).join("");
+ refresh()}catch(e){$("delta").textContent=e.message}};
+$("reset").onclick=async()=>{try{await j("/simulate/reset",{method:"POST"});$("delta").textContent="Baseline restored.";$("cmp").innerHTML="";refresh()}catch(e){$("delta").textContent=e.message}};
+const dot=DotChart($("dc"));$("dcRange").onchange=$("dcMetric").onchange=loadHistory;const grp=DotGroups($("cRes")),ring=DotRing($("cSev"));mkGlobe();refresh();schedule();
+</script></body></html>
