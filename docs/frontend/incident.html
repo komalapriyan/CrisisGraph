@@ -7,7 +7,7 @@
 <div id="body" hidden>
 <div class="grid two"><div class="card"><h2>Overview</h2><p id="sum"></p><p class="mute" id="meta"></p></div>
 <div class="card"><h2 id="depT">Resource reachability</h2><div class="wrap"><table id="deps"></table></div></div></div>
-<div class="grid two"><div class="card"><h2>Dependency graph <span class="mute">click a node</span></h2><div class="wrap"><svg id="g" width="900" height="360" viewBox="0 0 900 360" role="img" aria-label="Dependency graph"></svg></div><p class="mute" id="gnote"></p></div>
+<div class="grid two"><div class="card"><h2>Dependency graph <span class="mute">click a node</span></h2><div class="wrap"><svg id="g" width="900" height="360" viewBox="0 0 900 360" role="img" aria-label="Dependency graph"></svg></div></div>
 <div class="card"><h2>Node details</h2><div id="nd" class="mute">Select a node.</div></div></div>
 <div class="card"><h2>Resource assessment</h2><div class="wrap"><div id="plan"></div></div></div></div></main>
 <script src="api.js"></script>
@@ -18,7 +18,7 @@ function renderDeps(d,fac){
  if(!fac){$("depT").textContent="Resource reachability";$("deps").innerHTML="<tr><th>Location</th><th>Road</th><th>Provider</th><th>Resource</th><th>Stock</th></tr>"+(d.length?d.map(r=>`<tr><td>${esc(r.location)}</td><td class="${r.road_status==="open"?"ok":"bad"}">${esc(r.road)} (${esc(r.road_status)})</td><td>${esc(r.provider)}</td><td>${esc(r.resource)}</td><td>${r.stock}</td></tr>`).join(""):'<tr><td colspan=5 class="mute">No dependencies stored.</td></tr>');return}
  $("depT").textContent="Nearby mapped facilities";const x=fac.discovery;
  if(x.status!=="ok"){$("deps").innerHTML=`<tr><td class="mute">${x.status==="failed"?"Facility lookup failed: "+esc(x.error||"unknown")+". The incident graph is still built; the lookup retries every 10 minutes. ":"Facility lookup has not run yet. The backend runs it in the background for live incidents."} <button class="btn" onclick="runDisc()">Find facilities now</button> <span id="dsMsg" class="mute"></span></td></tr>`;return}
- $("deps").innerHTML="<tr><th>Facility</th><th>Type</th><th>km</th><th>Source</th></tr>"+(fac.facilities.length?fac.facilities.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(String(f.category||"facility").replace("_"," "))}</td><td>${f.distance_km??"unknown"}</td><td><a href="${esc(f.source_url)}" target="_blank" rel="noopener">OSM</a></td></tr>`).join(""):`<tr><td colspan=4 class="mute">No mapped facilities within ${x.radius_km} km.</td></tr>`)
+ $("deps").innerHTML="<tr><th>Facility</th><th>Type</th><th>km</th><th>Source</th></tr>"+(fac.facilities.length?fac.facilities.map(f=>`<tr><td>${esc(f.name)}</td><td>${esc(f.category.replace("_"," "))}</td><td>${f.distance_km}</td><td><a href="${esc(f.source_url)}" target="_blank" rel="noopener">OSM</a></td></tr>`).join(""):`<tr><td colspan=4 class="mute">No mapped facilities within ${x.radius_km} km.</td></tr>`)
   +`<tr><td colspan=4 class="mute">${esc(x.source)}, retrieved ${x.at?new Date(x.at*1000).toLocaleString():""}. Mapped only: not verified as operating, staffed or stocked.</td></tr>`}
 async function renderAssess(a){
  const ai=a.ai||{status:"disabled"},ok=ai.status==="ok"&&ai.data;let h="";
@@ -38,31 +38,18 @@ async function renderAssess(a){
 async function act(path,msgId){const m=$(msgId);m.textContent="Running…";try{const r=await j("/incidents/"+encodeURIComponent(id)+path,{method:"POST"});m.textContent="Result: "+r.result;await load()}catch(e){m.textContent="Failed: "+e.message}}
 const runAi=()=>act("/analyze","aiMsg"),runDisc=()=>act("/discover","dsMsg");
 function fail(m){$("err").hidden=false;$("err").innerHTML=m+' <a href="index.html">Back to Dashboard</a>';$("body").hidden=true;$("name").textContent="Incident unavailable"}
-let loadSeq=0;
 async function load(){
  if(!id)return fail("No incident id in the URL.");
- const seq=++loadSeq;
  try{
   const en=encodeURIComponent(id),i=await j("/incidents/"+en),live=!!i.source;
-  const S=p=>Promise.resolve(p).then(v=>({v}),e=>({e}));   // one failing section must not hide the others
-  const [d,g,as,fac]=await Promise.all([
-   S(live?[]:j("/incidents/"+en+"/dependencies").catch(x=>x.status===404?[]:Promise.reject(x))),
-   S(live?j("/incidents/"+en+"/graph"):j("/graph")),
-   S(j("/incidents/"+en+"/assessment")),
-   S(live?j("/incidents/"+en+"/facilities"):null)]);
-  if(seq!==loadSeq)return;   // a newer load started; drop this stale result
+  const [d,g,as,fac]=await Promise.all([live?[]:j("/incidents/"+en+"/dependencies").catch(x=>x.status===404?[]:Promise.reject(x)),live?j("/incidents/"+en+"/graph"):j("/graph"),j("/incidents/"+en+"/assessment"),live?j("/incidents/"+en+"/facilities"):null]);
   $("err").hidden=true;$("body").hidden=false;document.title="CrisisGraph — "+i.name;
   $("crumb").textContent=$("name").textContent=i.name;$("sev").textContent=i.severity||"unrated";$("sev").style.color=SEV[i.severity||"unrated"];
   $("stat").textContent=i.status;$("orig").textContent=i.data_origin==="synthetic"?"SIMULATED":i.data_origin;$("sum").innerHTML=esc(i.summary)+(i.source_url?` <a href="${esc(i.source_url)}" target="_blank" rel="noopener">Source: ${esc(i.source)}</a>`:"");
   $("meta").textContent=`ID ${i.id} · ${i.category} · ${i.source?"source "+i.source:"simulated"} · event ${i.event_time?new Date(i.event_time*1000).toLocaleString():"time unknown"} · retrieved ${i.retrieved_at?new Date(i.retrieved_at*1000).toLocaleString():"n/a"} · ${Number.isFinite(i.lat)?i.lat+", "+i.lng:"no coordinates"} · loaded ${new Date().toLocaleTimeString()}`;
-  const dep=live?fac:d;
-  if(dep.e)$("deps").innerHTML=`<tr><td class="bad">This section could not be loaded: ${esc(dep.e.message)} <button class="btn" onclick="load()">Retry</button></td></tr>`;else renderDeps(d.v,fac.v);
-  if(as.e)$("plan").innerHTML=`<p class="bad">Assessment could not be loaded: ${esc(as.e.message)}</p>`;
-  else renderAssess(as.v).catch(x=>{$("plan").innerHTML=`<p class="bad">Assessment could not be displayed: ${esc(x.message)}</p>`});
-  const gn=$("gnote");gn.textContent="";
-  if(g.e){$("g").style.display="none";$("g").innerHTML="";$("nd").innerHTML=`<span class="bad">The graph could not be loaded: ${esc(g.e.message)}</span>`}
-  else if(g.v.nodes.some(n=>n.id===i.id)){drawGraph(g.v,i.id);const m=g.v.metadata||{};gn.textContent=(m.warnings||[]).join(" ")}
-  else{$("g").style.display="none";$("g").innerHTML="";$("nd").textContent="The server returned no graph data for this incident."}
+  renderDeps(d,fac);
+  renderAssess(as);
+  if(g.nodes.some(n=>n.id===i.id))drawGraph(g,i.id);else{$("g").style.display="none";$("g").innerHTML="";$("nd").innerHTML='No graph exists for this incident yet. It is built automatically within a minute or two; press <b>Find facilities now</b> to build it immediately.'}
  }catch(e){fail(e.status===404?"Incident “"+esc(id)+"” was not found.":esc(e.message))}
 }
 function drawGraph(g,focus){
@@ -75,13 +62,9 @@ function drawGraph(g,focus){
  g.nodes.forEach(n=>{const p=pos[n.id],bad=n.status==="closed"||n.status==="inactive";
   h+=`<g class="n" data-id="${esc(n.id)}" tabindex="0" style="cursor:pointer"><circle cx="${p.x}" cy="${p.y}" r="13" fill="${CC[n.type]||"#888"}" stroke="${bad?"#ef4444":"#0b1220"}" stroke-width="${bad?4:2}"/><text x="${p.x}" y="${p.y+27}" text-anchor="middle">${esc(String(n.label).slice(0,16))}</text></g>`});
  svg.innerHTML=h;
- const fmt=(k,v)=>/(_time|_at)$/.test(k)&&Number.isFinite(v)?new Date(v*1000).toLocaleString():/^https?:\/\//.test(String(v))?`<a href="${esc(String(v))}" target="_blank" rel="noopener">${esc(String(v))}</a>`:esc(String(v));
- const show=nid=>{const n=g.nodes.find(x=>x.id===nid);if(!n)return;const rel=g.edges.filter(e=>e.from===nid||e.to===nid);
+ const show=nid=>{const n=g.nodes.find(x=>x.id===nid),rel=g.edges.filter(e=>e.from===nid||e.to===nid);
   svg.querySelectorAll("line").forEach((l,k)=>{const on=rel.includes(g.edges[k]);l.setAttribute("stroke",on?"#22d3ee":"#3b4a6b");l.setAttribute("stroke-width",on?2.5:1.2)});
-  const pr=Object.entries(n.properties||{}).map(([k,v])=>`<tr><td class="mute">${esc(k)}</td><td>${fmt(k,v)}</td></tr>`).join("");
-  $("nd").innerHTML=`<b>${esc(n.label)}</b> <span class="pill">${esc(n.type)}</span> <span class="pill ${n.status==="closed"?"bad":""}">${esc(n.status||"no status")}</span><p class="mute">ID ${esc(n.id)}</p>`
-   +(pr?`<table>${pr}</table>`:'<p class="mute">No further attributes are stored for this node.</p>')
-   +(rel.length?"<ul>"+rel.map(e=>{const o=g.nodes.find(x=>x.id===(e.from===nid?e.to:e.from)),ep=e.properties||{};return `<li>${e.from===nid?"":"← "}${esc(e.type)}${e.from===nid?" →":""} ${esc(o?o.label:"?")}${ep.distance_km!=null?" ("+esc(String(ep.distance_km))+" km)":""}</li>`}).join("")+"</ul>":'<p class="mute">No relationships are stored for this node yet.</p>')};
+  $("nd").innerHTML=`<b>${esc(n.label)}</b> <span class="pill">${esc(n.type)}</span> <span class="pill ${n.status==="closed"?"bad":""}">${esc(n.status||"no status")}</span><ul>`+rel.map(e=>{const o=g.nodes.find(x=>x.id===(e.from===nid?e.to:e.from));return `<li>${e.from===nid?"":"← "}${esc(e.type)}${e.from===nid?" →":""} ${esc(o.label)}</li>`}).join("")+"</ul>"};
  svg.querySelectorAll(".n").forEach(el=>{el.onclick=()=>show(el.dataset.id);el.onkeydown=e=>{if(e.key==="Enter")show(el.dataset.id)}});
  if(pos[focus])show(focus);
 }
