@@ -1,3 +1,0 @@
-# Tells Vercel where the FastAPI app is. Dependencies still come from requirements.txt.
-[tool.vercel]
-entrypoint = "app.main:app"
